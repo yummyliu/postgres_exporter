@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -790,6 +791,39 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.psqlUp
 	e.userQueriesError.Collect(ch)
 }
+func (e *Exporter) getDbInfo(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+
+	mdb, err := e.getDB(e.dsn)
+	if err != nil {
+		loggableDsn := "could not parse DATA_SOURCE_NAME"
+		// If the DSN is parseable, log it with a blanked out password
+		pDsn, pErr := url.Parse(e.dsn)
+		if pErr == nil {
+			// Blank user info if not nil
+			if pDsn.User != nil {
+				pDsn.User = url.UserPassword(pDsn.User.Username(), "PASSWORD_REMOVED")
+			}
+			loggableDsn = pDsn.String()
+		}
+		log.Infof("Error opening connection to database (%s): %s", loggableDsn, err)
+		e.psqlUp.Set(0)
+		e.error.Set(1)
+		return
+	}
+
+    ma := getDbAge(mdb)
+    du := getDbDiskUsage(mdb)
+    log.Infof("%d:%f", ma,du)
+    dbinfo := &DbInfo{
+        Maxage: ma,
+        DiskUsage : du,
+    }
+
+    json, err := json.Marshal(dbinfo)
+    HandleError(err)
+    w.Write(json)
+}
 
 func newConstLabels() prometheus.Labels {
 	if constantLabelsList == nil || *constantLabelsList == "" {
@@ -1168,6 +1202,16 @@ func main() {
 	}()
 
 	prometheus.MustRegister(exporter)
+
+	go func() {
+		server := http.Server{
+			Addr: "0.0.0.0:9999",
+		}
+		http.HandleFunc("/dbinfo", exporter.getDbInfo)
+
+		log.Info("patrol service on (9999)...")
+		server.ListenAndServe()
+	}()
 
 	http.Handle(*metricPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
